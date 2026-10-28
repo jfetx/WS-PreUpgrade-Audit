@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/jfetx/WS-PreUpgrade-Audit/actions/workflows/ci.yml/badge.svg)
 
-Kit d'audit **en lecture seule** pour la journée de cadrage d'une migration
+Kit d'audit **en lecture seule** pour migration
 **Windows Server 2019 → Windows Server 2025** : hyperviseur Hyper-V, contrôleur(s) de domaine
 (AD DS / DNS / DHCP / GPO), Services Bureau à distance (RDS) et rôles courants.
 
