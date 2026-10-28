@@ -68,6 +68,10 @@
     SSE4.2/POPCNT. Ordre de recherche : ce paramètre, puis à côté du script,
     puis téléchargement automatique (sauf -NoDownload).
 
+.PARAMETER CheckpointDeltaGB
+    Hôte Hyper-V : volume d'écritures estimé (Go) dans l'AVHDX d'une VM pendant
+    l'upgrade de son OS, pour le calcul de l'espace nécessaire aux checkpoints. Défaut : 30
+
 .PARAMETER NoDownload
     N'essaie pas de télécharger Coreinfo depuis Sysinternals (serveur sans Internet).
     Par défaut, si Coreinfo64.exe est absent, il est téléchargé dans le dossier
@@ -104,6 +108,7 @@ param(
     [ValidateRange(0, 16)][int]$SetupImageIndex = 0,
     [string]$CoreinfoPath,
     [switch]$NoDownload,
+    [ValidateRange(5, 500)][int]$CheckpointDeltaGB = 30,
     [ValidateSet('System', 'Hardware', 'Storage', 'Network', 'Features', 'Updates', 'Software', 'Security',
         'Policies', 'Events', 'ActiveDirectory', 'GPO', 'DNS', 'DHCP', 'RDS', 'HyperV', 'Guest',
         'OtherRoles', 'Printing', 'Backup', 'LegacyAuth', 'SetupCompat')]
@@ -117,7 +122,7 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
 #region ===================== Initialisation =====================
-$Script:AuditVersion = '1.1.3'
+$Script:AuditVersion = '1.1.4'
 $Script:Start = Get-Date
 $Script:HostName = $env:COMPUTERNAME
 if (-not $Script:HostName) { $Script:HostName = [System.Net.Dns]::GetHostName() }
@@ -1822,6 +1827,7 @@ function Invoke-HyperVCollector {
                 }
             }
             $rows = @($rows)
+            $script:vmDisks = $rows
             Add-Table 'Disques virtuels' $rows
             $pt = @($rows | Where-Object { $_.'Disque physique (pass-through)' -ne $null -and "$($_.'Disque physique (pass-through)')" -ne '' })
             if ($pt.Count) { Add-Finding Moyen 'Hyper-V' 'Disques pass-through' (($pt | ForEach-Object { "$($_.VM) → disque $($_.'Disque physique (pass-through)')" }) -join ', ') 'Pas de checkpoint ni de sauvegarde au niveau hôte pour ces disques : sauvegarde depuis l''invité obligatoire.' }
@@ -1878,6 +1884,60 @@ function Invoke-HyperVCollector {
                 $old = @($snap | Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-7) })
                 Add-Finding $(if ($old.Count) { 'Eleve' } else { 'Moyen' }) 'Hyper-V' "$($snap.Count) checkpoint(s) existant(s) ($($old.Count) de plus de 7 j)" (($snap | ForEach-Object { "$($_.VMName): $($_.Name) ($($_.CreationTime.ToString('yyyy-MM-dd')))" }) -join ' | ') 'Supprimer/fusionner les anciens checkpoints. Ne JAMAIS restaurer un checkpoint standard d''un DC (risque USN rollback) : utiliser les checkpoints de production + sauvegarde état système.'
             }
+        }
+        Invoke-Step 'Espace pour checkpoints' {
+            # Estimation de l'espace consommé par un checkpoint pris juste avant l'upgrade de chaque invité :
+            # l'AVHDX (à côté du disque système) reçoit ~ -CheckpointDeltaGB d'écritures pendant l'upgrade ;
+            # un checkpoint standard d'une VM démarrée sauvegarde aussi sa RAM (dossier des checkpoints).
+            $volOf = {
+                param([string]$p)
+                $root = if ($p -match '^[A-Za-z]:') { $Matches[0].ToUpper() + '\' } else { [System.IO.Path]::GetPathRoot($p) }
+                $o = [pscustomobject]@{ Key = $root; Free = $null; Size = $null }
+                try {
+                    $v = Get-Volume -FilePath $p -ErrorAction Stop
+                    if ($p -match '^[A-Za-z]:\\ClusterStorage\\[^\\]+') { $o.Key = $Matches[0] } elseif ($v.DriveLetter) { $o.Key = "$($v.DriveLetter):\" }
+                    $o.Free = $v.SizeRemaining; $o.Size = $v.Size
+                } catch { try { $d = Get-PSDrive $root.Substring(0, 1) -ErrorAction Stop; $o.Free = $d.Free; $o.Size = $d.Used + $d.Free } catch { } }
+                return $o
+            }
+            $disks = @($script:vmDisks)
+            $vols = @{}; $perVm = @(); $noCp = @(); $pass = @()
+            foreach ($v in $vms) {
+                $vd = @($disks | Where-Object { $_.VM -eq $v.Name -and $_.Chemin })
+                if (@($disks | Where-Object { $_.VM -eq $v.Name -and "$($_.'Disque physique (pass-through)')" -ne '' }).Count) { $pass += $v.Name }
+                if ("$($v.CheckpointType)" -eq 'Disabled') { $noCp += $v.Name; continue }
+                $ramGB = 0
+                if ("$($v.CheckpointType)" -eq 'Standard' -and "$($v.State)" -eq 'Running') { $ramGB = [math]::Round($v.MemoryAssigned / 1GB, 1) }
+                $diskVol = if ($vd.Count) { & $volOf $vd[0].Chemin } else { $null }
+                $snapPath = if ($v.SnapshotFileLocation) { $v.SnapshotFileLocation } else { $v.Path }
+                $ramVol = if ($ramGB -gt 0 -and $snapPath) { & $volOf $snapPath } else { $null }
+                foreach ($x in @(@{ Vol = $diskVol; GB = $(if ($diskVol) { $CheckpointDeltaGB } else { 0 }) }, @{ Vol = $ramVol; GB = $ramGB })) {
+                    if (-not $x.Vol -or -not $x.GB) { continue }
+                    if (-not $vols.ContainsKey($x.Vol.Key)) { $vols[$x.Vol.Key] = [pscustomobject]@{ Vol = $x.Vol; Need = 0.0; VMs = @() } }
+                    $vols[$x.Vol.Key].Need += $x.GB
+                    if ($vols[$x.Vol.Key].VMs -notcontains $v.Name) { $vols[$x.Vol.Key].VMs += $v.Name }
+                }
+                $perVm += [pscustomobject]@{
+                    VM = $v.Name; 'État' = "$($v.State)"; 'Type de checkpoint' = "$($v.CheckpointType)"
+                    'Volume disque système' = $(if ($diskVol) { $diskVol.Key }); 'AVHDX estimé (Go)' = $(if ($diskVol) { $CheckpointDeltaGB } else { 0 })
+                    'RAM sauvegardée (Go)' = $ramGB; 'Dossier des checkpoints' = $snapPath
+                }
+            }
+            Add-Table 'Espace pour checkpoints : estimation par VM' $perVm -Note ("Hypothèse : {0} Go écrits dans l'AVHDX pendant l'upgrade d'un invité (paramètre -CheckpointDeltaGB) ; RAM comptée uniquement pour un checkpoint « Standard » d'une VM démarrée (un checkpoint de production ou d'une VM éteinte ne sauvegarde pas la mémoire)." -f $CheckpointDeltaGB)
+            $volRows = foreach ($k in $vols.Keys) {
+                $e = $vols[$k]; $freeGB = if ($null -ne $e.Vol.Free) { [math]::Round($e.Vol.Free / 1GB, 1) } else { $null }
+                $after = if ($null -ne $freeGB) { [math]::Round($freeGB - $e.Need, 1) } else { $null }
+                $status = if ($null -eq $freeGB) { 'INCONNU' } elseif ($after -lt 0) { 'INSUFFISANT' } elseif ($after -lt [math]::Max(20, 0.1 * $freeGB)) { 'MARGE FAIBLE' } else { 'OK' }
+                [pscustomobject]@{ Volume = $k; 'VM concernées' = ($e.VMs -join ', '); 'Besoin estimé (Go)' = [math]::Round($e.Need, 1); 'Espace libre (Go)' = $freeGB; 'Libre après checkpoints (Go)' = $after; Statut = $status }
+            }
+            $volRows = @($volRows | Sort-Object Volume)
+            Add-Table 'Espace pour checkpoints : par volume' $volRows -Note 'Si toutes les VM du volume reçoivent un checkpoint en même temps avant leur upgrade. En les mettant à niveau une par une (checkpoint supprimé/fusionné entre chaque), le besoin se limite à la VM la plus gourmande.'
+            foreach ($r in $volRows) {
+                if ($r.Statut -eq 'INSUFFISANT') { Add-Finding Eleve 'Hyper-V' "Espace insuffisant pour les checkpoints sur $($r.Volume)" ("Besoin estimé {0} Go ({1}) pour {2} Go libres." -f $r.'Besoin estimé (Go)', $r.'VM concernées', $r.'Espace libre (Go)') 'Libérer/étendre le volume, déplacer des VM, ou mettre à niveau les invités un par un en supprimant chaque checkpoint après validation. Un volume plein met les VM en pause.' }
+                elseif ($r.Statut -eq 'MARGE FAIBLE') { Add-Finding Moyen 'Hyper-V' "Marge faible pour les checkpoints sur $($r.Volume)" ("Besoin estimé {0} Go ({1}) ; il resterait {2} Go libres." -f $r.'Besoin estimé (Go)', $r.'VM concernées', $r.'Libre après checkpoints (Go)') 'Mettre à niveau les invités un par un (checkpoint supprimé entre chaque) ou libérer de l''espace avant la fenêtre.' }
+            }
+            if ($noCp.Count) { Add-Finding Moyen 'Hyper-V' 'Checkpoints désactivés sur des VM' ($noCp -join ', ') 'Aucun retour arrière par checkpoint possible : prévoir un export ou une sauvegarde complète de ces VM avant leur upgrade.' }
+            if ($pass.Count) { Add-Note ("Disques pass-through (non couverts par un checkpoint) : {0}" -f ($pass -join ', ')) }
         }
         Invoke-Step 'Réplica / sécurité' {
             $rep = @(Hyper-V\Get-VMReplication -ErrorAction SilentlyContinue)

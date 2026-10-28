@@ -37,7 +37,7 @@ Check ($res.Zip -and (Test-Path $res.Zip)) 'Archive ZIP générée'
 $json = Get-Content (Join-Path $res.Folder 'audit.json') -Raw | ConvertFrom-Json
 Check ($json.Meta.Host -eq 'SRV-HV01') 'audit.json lisible'
 $titles = $json.Findings.Title -join "`n"
-foreach ($exp in 'Niveaux fonctionnels insuffisants', 'équipe LBFO', 'Compatibilité processeur activée', 'NTLMv1 encore utilisé', 'Binds LDAP non signés', 'Aucune CAL RDS 2025', 'Un seul contrôleur de domaine', 'Serveur SMTP') {
+foreach ($exp in 'Niveaux fonctionnels insuffisants', 'équipe LBFO', 'Compatibilité processeur activée', 'NTLMv1 encore utilisé', 'Binds LDAP non signés', 'Aucune CAL RDS 2025', 'Un seul contrôleur de domaine', 'Serveur SMTP', 'pour les checkpoints sur') {
     Check ($titles -match [regex]::Escape($exp)) "Constat attendu : $exp"
 }
 Check ($json.Meta.Verdict -like 'NON PRÊT*') 'Verdict NON PRÊT'

@@ -95,6 +95,7 @@ ou un RDS avec beaucoup de profils — utiliser `-Quick` si besoin).
 | `-SkipSection Events,Software` | Ignorer des sections |
 | `-CoreinfoPath C:\Tools\Coreinfo64.exe` | Utiliser un Coreinfo déjà présent |
 | `-NoDownload` | Ne pas télécharger Coreinfo (serveur isolé) |
+| `-CheckpointDeltaGB 40` | Hôte Hyper-V : écritures estimées par VM dans l'AVHDX pendant l'upgrade de l'invité, pour le calcul de l'espace des checkpoints (défaut 30 Go) |
 | `-SetupMediaPath D:\` | Lance aussi le **scan de compatibilité officiel Microsoft** (`setup.exe /auto upgrade /compat scanonly`) avec l'ISO WS2025 montée. Crée `C:\$WINDOWS.~BT` mais n'installe rien. 10 à 40 min. |
 | `-SetupImageIndex 2` | Index d'image du média (1 Std Core, 2 Std Bureau, 3 DC Core, 4 DC Bureau) — déduit sinon |
 | `-NoZip` | Pas d'archive |
@@ -151,7 +152,8 @@ stratégies RDS, profils (taille, obsolescence), FSLogix, Office (activation par
 **Hyper-V** : hôte, versions de configuration, **vSwitch lié à LBFO** (bloquant), SET, VM
 (génération, version, mémoire, actions auto), **compatibilité processeur** (masque SSE4.2),
 disques (pass-through, différenciation, fragmentation, **surallocation**), cartes réseau/VLAN/MAC,
-ISO montées, services d'intégration, **OS invités via KVP**, checkpoints, Réplica, **vTPM**
+ISO montées, services d'intégration, **OS invités via KVP**, checkpoints, **espace nécessaire aux
+checkpoints avant l'upgrade des invités** (par VM et par volume), Réplica, **vTPM**
 (certificats à exporter), capacité mémoire, cluster.
 
 **Usage réel des protocoles hérités** (journaux, pas seulement la configuration) : qui utilise

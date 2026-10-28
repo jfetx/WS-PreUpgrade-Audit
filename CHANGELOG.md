@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.4 — 2026-10-28
+
+### Ajouté
+- **Espace pour checkpoints** (hôte Hyper-V) : estimation, par VM puis par volume, de l'espace consommé
+  par un checkpoint pris juste avant l'upgrade de chaque invité : AVHDX à côté du disque système
+  (`-CheckpointDeltaGB`, 30 Go par défaut) + RAM pour un checkpoint « Standard » d'une VM démarrée.
+  Comparaison avec l'espace libre : ÉLEVÉ si insuffisant, MOYEN si la marge restante est faible
+  (< 20 Go ou < 10 %). Signale aussi les VM aux checkpoints désactivés et les disques pass-through.
+
 ## 1.1.3 — 2026-10-28
 
 ### Corrigé
