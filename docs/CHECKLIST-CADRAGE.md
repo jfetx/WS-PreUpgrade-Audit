@@ -7,12 +7,12 @@ contexte métier, contraintes, licences, interlocuteurs. À dérouler avec le cl
 
 | Créneau | Activité | Livrable |
 |---|---|---|
-| 09:00 – 09:45 | Kick-off : objectifs, périmètre, contraintes, interlocuteurs | Section 2 remplie |
-| 09:45 – 11:30 | Exécution de `Invoke-PreUpgradeAudit.ps1` sur hyperviseur, DC, RDS (en parallèle de l'entretien) | ZIP par serveur |
-| 11:30 – 12:30 | Entretien applications métier / utilisateurs RDS / impression | Section 4 remplie |
-| 13:30 – 14:30 | `Merge-AuditReports.ps1`, lecture des points CRITIQUE / ÉLEVÉ | Rapport consolidé |
-| 14:30 – 16:00 | Vérifications ciblées (console iDRAC/iLO, sauvegardes, licences, accès éditeurs) | Sections 3 et 5 |
-| 16:00 – 17:00 | Restitution : verdict, stratégie (sur place vs side-by-side), planning, devis licences | Plan d'action CSV + Go/No-Go |
+| 09:00 - 09:45 | Kick-off : objectifs, périmètre, contraintes, interlocuteurs | Section 2 remplie |
+| 09:45 - 11:30 | Exécution de `Invoke-PreUpgradeAudit.ps1` sur hyperviseur, DC, RDS (en parallèle de l'entretien) | ZIP par serveur |
+| 11:30 - 12:30 | Entretien applications métier / utilisateurs RDS / impression | Section 4 remplie |
+| 13:30 - 14:30 | `Merge-AuditReports.ps1`, lecture des points CRITIQUE / ÉLEVÉ | Rapport consolidé |
+| 14:30 - 16:00 | Vérifications ciblées (console iDRAC/iLO, sauvegardes, licences, accès éditeurs) | Sections 3 et 5 |
+| 16:00 - 17:00 | Restitution : verdict, stratégie (sur place vs side-by-side), planning, devis licences | Plan d'action CSV + Go/No-Go |
 
 ## 2. Contexte et contraintes
 
