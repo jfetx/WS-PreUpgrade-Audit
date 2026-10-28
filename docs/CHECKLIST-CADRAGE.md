@@ -1,4 +1,4 @@
-# Journée de cadrage — migration Windows Server 2019 → 2025
+# Journée de cadrage — migration Windows Server 2019/2022 → 2025
 
 Le script collecte l'état technique. Cette checklist couvre ce qu'**aucun script ne peut deviner** :
 contexte métier, contraintes, licences, interlocuteurs. À dérouler avec le client pendant la journée.
