@@ -117,7 +117,7 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
 #region ===================== Initialisation =====================
-$Script:AuditVersion = '1.1.2'
+$Script:AuditVersion = '1.1.3'
 $Script:Start = Get-Date
 $Script:HostName = $env:COMPUTERNAME
 if (-not $Script:HostName) { $Script:HostName = [System.Net.Dns]::GetHostName() }
@@ -444,6 +444,11 @@ function Initialize-Context {
     $Script:BIOS = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
     $Script:CV = Get-RegKeyValues 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     if (-not $Script:CV) { $Script:CV = [ordered]@{} }
+    # Version source (libellés des constats) et version de configuration VM par défaut de l'hôte
+    $srcMap = @{ 9600 = @('2012 R2', '5.0'); 14393 = @('2016', '8.0'); 17763 = @('2019', '9.0'); 20348 = @('2022', '10.0'); 26100 = @('2025', '12.0') }
+    $b = 0; [void][int]::TryParse("$($Script:CV.CurrentBuild)", [ref]$b)
+    $Script:SrcOS = if ($srcMap[$b]) { $srcMap[$b][0] } else { "build $b" }
+    $Script:SrcVmVersion = if ($srcMap[$b]) { $srcMap[$b][1] } else { $null }
 
     $Script:Features = @()
     if (Test-Cmd 'Get-WindowsFeature') {
@@ -552,7 +557,7 @@ function Invoke-SystemCollector {
             Add-Table 'Licence Windows' $rows
             foreach ($l in $lic) {
                 if ([int]$l.LicenseStatus -ne 1) { Add-Finding Eleve 'Licence' 'Windows non activé' "Statut : $($status[[int]$l.LicenseStatus])" 'Activer Windows avant toute mise à niveau.' }
-                if ($l.ProductKeyChannel -match 'OEM') { Add-Finding Info 'Licence' 'Licence OEM' "Canal : $($l.ProductKeyChannel). Une licence OEM 2019 est liée au matériel et ne couvre pas WS2025." 'Prévoir une licence Windows Server 2025 (OEM/CSP/Volume) avant la migration.' }
+                if ($l.ProductKeyChannel -match 'OEM') { Add-Finding Info 'Licence' 'Licence OEM' "Canal : $($l.ProductKeyChannel). Une licence OEM $($Script:SrcOS) est liée au matériel et ne couvre pas WS2025." 'Prévoir une licence Windows Server 2025 (OEM/CSP/Volume) avant la migration.' }
             }
         }
 
@@ -560,9 +565,9 @@ function Invoke-SystemCollector {
             Add-Finding Critique 'Édition' "Édition d'évaluation détectée ($($cv.EditionID))" 'La mise à niveau sur place depuis une édition Evaluation n''est pas supportée.' 'Convertir en édition commerciale (DISM /online /Set-Edition) avant l''upgrade, ou réinstaller.'
         }
         if ($cv.CurrentBuild -and [int]$cv.CurrentBuild -ne 17763) {
-            Add-Finding Info 'Système' "Build $($cv.CurrentBuild) (et non 17763 / WS2019)" 'Le script cible WS2019 mais reste applicable.' 'Vérifier le chemin de mise à niveau supporté vers WS2025.'
+            Add-Finding Info 'Système' $(if ($Script:SrcVmVersion) { "Système source : Windows Server $($Script:SrcOS) (build $($cv.CurrentBuild))" } else { "Système source : build $($cv.CurrentBuild) (version non reconnue)" }) 'La mise à niveau sur place directe vers WS2025 est supportée depuis 2012 R2, 2016, 2019 et 2022.' 'Vérifier le chemin de mise à niveau et la compatibilité des rôles/applications pour cette version source.'
         }
-        Add-Finding Info 'Mise à niveau' 'Contraintes de la mise à niveau sur place 2019 → 2025' ("Langue de base : {0} ; type d'installation : {1} ; édition : {2}." -f $osLang, $cv.InstallationType, $cv.EditionID) "Utiliser un média WS2025 de MÊME langue ($osLang), même édition (Standard→Standard / Datacenter→Datacenter) et même type (Server Core / Expérience de bureau), sinon les applications et paramètres ne sont pas conservés."
+        Add-Finding Info 'Mise à niveau' "Contraintes de la mise à niveau sur place $($Script:SrcOS) → 2025" ("Langue de base : {0} ; type d'installation : {1} ; édition : {2}." -f $osLang, $cv.InstallationType, $cv.EditionID) "Utiliser un média WS2025 de MÊME langue ($osLang), même édition (Standard→Standard / Datacenter→Datacenter) et même type (Server Core / Expérience de bureau), sinon les applications et paramètres ne sont pas conservés."
         if ($uptime -and $uptime.TotalDays -gt 45) {
             Add-Finding Moyen 'Système' ("Uptime élevé : {0:N0} jours" -f $uptime.TotalDays) 'Un redémarrage n''a pas été testé depuis longtemps (services qui ne redémarrent pas, MAJ en attente).' 'Faire un redémarrage contrôlé AVANT la fenêtre de migration pour valider le retour à l''état nominal.'
         }
@@ -983,7 +988,8 @@ function Invoke-SoftwareCollector {
         Invoke-Step 'Pilotes tiers' {
             $drv = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { $_.DriverProviderName -and $_.DriverProviderName -notmatch '^Microsoft' -and $_.DeviceName })
             Add-Table 'Pilotes de périphériques tiers' ($drv | Sort-Object DriverProviderName, DeviceName | Select-Object DeviceName, DeviceClass, DriverProviderName, DriverVersion, @{n = 'DriverDate'; e = { $_.DriverDate } }, InfName, IsSigned)
-            $old = @($drv | Where-Object { $_.DriverDate -and $_.DriverDate -lt (Get-Date).AddYears(-6) -and $_.DeviceClass -match 'NET|SCSIADAPTER|HDC|DISPLAY|SYSTEM' })
+            # Exclut les INF « chipset » Intel (date fictive 1968-07-18) et les pilotes factices (version 0.0.0.x)
+            $old = @($drv | Where-Object { $_.DriverDate -and $_.DriverDate.Year -ge 1990 -and $_.DriverDate -lt (Get-Date).AddYears(-6) -and "$($_.DriverVersion)" -notmatch '^0\.0\.0\.' -and $_.DeviceClass -match 'NET|SCSIADAPTER|HDC|DISPLAY|SYSTEM' })
             if ($old.Count -and -not $Script:Roles.IsVM) { Add-Finding Moyen 'Pilotes' "$($old.Count) pilote(s) critique(s) de plus de 6 ans" (($old | Select-Object -First 10 | ForEach-Object { "$($_.DeviceName) ($($_.DriverVersion))" }) -join ' | ') 'Vérifier sur le site du constructeur (HPE/Dell/Lenovo...) le support WS2025 du serveur et mettre à jour firmware/pilotes (SPP, SUU...) AVANT l''upgrade.' }
             $fl = Invoke-External 'fltmc.exe' 'filters' 30
             Add-Raw 'Filtres de système de fichiers (fltmc)' $fl 'fltmc_filters.txt'
@@ -1790,7 +1796,7 @@ function Invoke-HyperVCollector {
             $Script:Facts.VMs = $vms | ForEach-Object { $_.Name }
             $old = @($vms | Where-Object { [version]"$($_.Version)" -lt [version]'8.0' })
             if ($old.Count) { Add-Finding Moyen 'Hyper-V' "VM en version de configuration ancienne (< 8.0)" (($old | ForEach-Object { "$($_.Name)=$($_.Version)" }) -join ', ') 'Après migration de l''hôte et validation, mettre à jour (Update-VMVersion, irréversible, VM éteinte).' }
-            Add-Finding Info 'Hyper-V' 'Version de configuration des VM après upgrade de l''hôte' 'Les VM gardent leur version (9.0 pour 2019) et restent déplaçables vers un hôte 2019 tant qu''elles ne sont pas mises à jour.' 'Ne lancer Update-VMVersion qu''une fois le retour arrière exclu.'
+            Add-Finding Info 'Hyper-V' 'Version de configuration des VM après upgrade de l''hôte' ("Les VM gardent leur version (défaut de l'hôte actuel {0} : {1}) et restent déplaçables vers un hôte {0} tant qu'elles ne sont pas mises à jour (12.0 = défaut WS2025)." -f $Script:SrcOS, $(if ($Script:SrcVmVersion) { $Script:SrcVmVersion } else { '?' })) 'Ne lancer Update-VMVersion qu''une fois le retour arrière exclu.'
             $stopAct = @($vms | Where-Object { "$($_.AutomaticStopAction)" -eq 'Save' })
             if ($stopAct.Count) { Add-Finding Faible 'Hyper-V' "VM avec action d'arrêt « Enregistrer »" (($stopAct.Name) -join ', ') 'Avant l''upgrade de l''hôte, ARRÊTER proprement les VM (pas d''état enregistré : incompatibilités possibles entre versions).' }
             $saved = @($vms | Where-Object { "$($_.State)" -match 'Saved|Paused' })
@@ -2249,6 +2255,25 @@ for ($i = 0; $i -lt $collectors.Count; $i++) {
 Write-Host ''
 Write-Log 'Génération du rapport...' 'HEAD'
 $res = Export-AuditReport
+Write-Log ("Verdict : {0}" -f $res.Verdict) $(if ($res.Verdict -like 'NON*') { 'ERR' } elseif ($res.Verdict -like '*CONDITIONS*') { 'WARN' } else { 'OK' })
+Write-Log ("Constats : {0}" -f (($res.Counts.Keys | ForEach-Object { '{0}={1}' -f $Script:SeverityLabel[$_], $res.Counts[$_] }) -join ' | '))
+Write-Log "Rapport : $($res.Html)" 'OK'
+
+# ---------- Récapitulatif console des problèmes de collecte ----------
+$errSecs = @($Script:Sections | Where-Object { $_.Errors.Count })
+Write-Host ''
+if ($errSecs.Count) {
+    Write-Log ("RÉCAPITULATIF : {0} section(s) avec erreurs de collecte (données partielles) :" -f $errSecs.Count) 'WARN'
+    foreach ($s in $errSecs) { foreach ($e in $s.Errors) { Write-Log ("   [{0}] {1}" -f $s.Id, $e) 'WARN' } }
+    Write-Log 'Causes fréquentes : console non élevée, module RSAT absent, compte sans droits AD, service arrêté. Détails : audit.log et section concernée du rapport.' 'INFO'
+} else { Write-Log 'RÉCAPITULATIF : aucune erreur de collecte.' 'OK' }
+$slow = @($Script:ExternalLog | Where-Object { $_.Code -eq 'TIMEOUT' -or ($_.Code -is [int] -and $_.Code -ne 0) })
+if ($slow.Count) { Write-Log ("{0} commande(s) externe(s) en échec ou en délai dépassé :" -f $slow.Count) 'WARN'; foreach ($x in $slow) { Write-Log ("   {0} -> {1}" -f $x.Commande, $x.Code) 'WARN' } }
+$crit = @($Script:Findings | Where-Object { $_.Severity -in 'Critique', 'Eleve' })
+if ($crit.Count) { Write-Log 'Points CRITIQUE / ÉLEVÉ à traiter :' 'WARN'; foreach ($f in ($crit | Sort-Object { $Script:SeverityOrder[$_.Severity] })) { Write-Log ('   [{0}] {1}' -f $Script:SeverityLabel[$f.Severity], $f.Title) 'FIND' $(if ($f.Severity -eq 'Critique') { 'Red' } else { 'DarkYellow' }) } }
+Write-Log ('Durée totale : {0:N1} min' -f ((Get-Date) - $Script:Start).TotalMinutes) 'INFO'
+
+# ZIP en dernier : audit.log archivé contient le verdict et le récapitulatif
 $zip = $null
 if (-not $NoZip) {
     try {
@@ -2266,23 +2291,6 @@ if (-not $NoZip) {
         } finally { $za.Dispose() }
     } catch { Write-Log "Archive ZIP : $($_.Exception.Message)" 'WARN'; $zip = $null }
 }
-Write-Log ("Verdict : {0}" -f $res.Verdict) $(if ($res.Verdict -like 'NON*') { 'ERR' } elseif ($res.Verdict -like '*CONDITIONS*') { 'WARN' } else { 'OK' })
-Write-Log ("Constats : {0}" -f (($res.Counts.Keys | ForEach-Object { '{0}={1}' -f $Script:SeverityLabel[$_], $res.Counts[$_] }) -join ' | '))
-Write-Log "Rapport : $($res.Html)" 'OK'
 if ($zip) { Write-Log "Archive : $zip" 'OK' }
-
-# ---------- Récapitulatif console des problèmes de collecte ----------
-$errSecs = @($Script:Sections | Where-Object { $_.Errors.Count })
-Write-Host ''
-if ($errSecs.Count) {
-    Write-Log ("RÉCAPITULATIF : {0} section(s) avec erreurs de collecte (données partielles) :" -f $errSecs.Count) 'WARN'
-    foreach ($s in $errSecs) { foreach ($e in $s.Errors) { Write-Log ("   [{0}] {1}" -f $s.Id, $e) 'WARN' } }
-    Write-Log 'Causes fréquentes : console non élevée, module RSAT absent, compte sans droits AD, service arrêté. Détails : audit.log et section concernée du rapport.' 'INFO'
-} else { Write-Log 'RÉCAPITULATIF : aucune erreur de collecte.' 'OK' }
-$slow = @($Script:ExternalLog | Where-Object { $_.Code -eq 'TIMEOUT' -or ($_.Code -is [int] -and $_.Code -ne 0) })
-if ($slow.Count) { Write-Log ("{0} commande(s) externe(s) en échec ou en délai dépassé :" -f $slow.Count) 'WARN'; foreach ($x in $slow) { Write-Log ("   {0} -> {1}" -f $x.Commande, $x.Code) 'WARN' } }
-$crit = @($Script:Findings | Where-Object { $_.Severity -in 'Critique', 'Eleve' })
-if ($crit.Count) { Write-Log 'Points CRITIQUE / ÉLEVÉ à traiter :' 'WARN'; foreach ($f in ($crit | Sort-Object { $Script:SeverityOrder[$_.Severity] })) { Write-Log ('   [{0}] {1}' -f $Script:SeverityLabel[$f.Severity], $f.Title) 'FIND' $(if ($f.Severity -eq 'Critique') { 'Red' } else { 'DarkYellow' }) } }
-Write-Log ('Durée totale : {0:N1} min' -f ((Get-Date) - $Script:Start).TotalMinutes) 'INFO'
 [pscustomobject]@{ ComputerName = $Script:HostName; Report = $res.Html; Folder = $Script:RunFolder; Zip = $zip; Verdict = $res.Verdict }
 #endregion

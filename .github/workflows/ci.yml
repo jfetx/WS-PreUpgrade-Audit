@@ -58,8 +58,12 @@ jobs:
           $bad += @($errs | Where-Object { $_ -like '`[Events`]*' })
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $za = [System.IO.Compression.ZipFile]::OpenRead($r.Zip)
-          $bs = @($za.Entries | Where-Object { $_.FullName -match '\\' }).Count; $za.Dispose()
+          $bs = @($za.Entries | Where-Object { $_.FullName -match '\\' }).Count
+          $logEntry = $za.GetEntry('audit.log'); $logTxt = ''
+          if ($logEntry) { $sr = New-Object System.IO.StreamReader($logEntry.Open()); $logTxt = $sr.ReadToEnd(); $sr.Dispose() }
+          $za.Dispose()
           if ($bs) { $bad += "ZIP : $bs entrée(s) avec « \ »" } else { Write-Host 'OK ZIP sans « \ »' }
+          if ($logTxt -notmatch 'Verdict :') { $bad += 'ZIP : audit.log incomplet (verdict absent)' } else { Write-Host 'OK audit.log complet dans le ZIP' }
           if ($bad) { $bad | ForEach-Object { Write-Error $_ }; exit 1 }
       - name: Publier le rapport en artefact
         if: always()

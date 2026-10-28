@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.3 — 2026-10-28
+
+### Corrigé
+- **Faux positif « pilotes de plus de 6 ans »** : les INF chipset Intel portent la date fictive
+  18/07/1968 et certains pilotes factices la version 0.0.0.x ; ils sont désormais ignorés.
+- **Libellés figés sur 2019** : la version source est détectée (2012 R2 / 2016 / 2019 / 2022) et
+  utilisée dans les constats (contraintes d'upgrade, licence OEM, version de configuration des VM
+  par défaut de l'hôte). Le constat « Build X (et non 17763) » devient « Système source : … ».
+- **audit.log tronqué dans le ZIP** : l'archive est créée en dernier, après le verdict et le
+  récapitulatif.
+
+### CI
+- Vérifie que l'audit.log archivé contient le verdict.
+
 ## 1.1.2 — 2026-10-28
 
 ### CI
