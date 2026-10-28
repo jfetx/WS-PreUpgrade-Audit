@@ -1,4 +1,6 @@
-# WS2025-PreUpgrade-Audit
+# WS-PreUpgrade-Audit
+
+![CI](https://github.com/jfetx/WS-PreUpgrade-Audit/actions/workflows/ci.yml/badge.svg)
 
 Kit d'audit **en lecture seule** pour la journée de cadrage d'une migration
 **Windows Server 2019 → Windows Server 2025** : hyperviseur Hyper-V, contrôleur(s) de domaine
@@ -29,13 +31,18 @@ brutes (CSV, JSON, sorties d'outils) pour la documentation.
 | `Run-Audit.cmd` | Lanceur double-clic (élévation UAC + ExecutionPolicy Bypass pour le processus) |
 | `Invoke-RemoteAudit.ps1` | Optionnel : exécution à distance via WinRM sur plusieurs serveurs + consolidation |
 | `Merge-AuditReports.ps1` | Consolide plusieurs audits en un rapport unique + plan d'action CSV |
+| `Compare-AuditReports.ps1` | Compare deux audits d'un même serveur (avant/après) : constats résolus, nouveaux, persistants |
+| `tests/` | Test de fumée avec modules Windows simulés (exécutable sous Linux/CI) |
+| `.github/workflows/ci.yml` | CI : test de fumée, PSScriptAnalyzer, exécution réelle sur un runner Windows Server |
 | `docs/CHECKLIST-CADRAGE.md` | Ce que le script ne peut pas deviner : questions d'entretien, Go/No-Go, plan type |
 
 ## Démarrage rapide (recommandé : exécution locale sur chaque serveur)
 
-1. Copier le dossier sur le serveur (ex. `C:\Temp\Audit`). Optionnel : y déposer
-   [`Coreinfo64.exe`](https://learn.microsoft.com/sysinternals/downloads/coreinfo) pour une
-   vérification formelle de SSE4.2/POPCNT.
+1. Copier le dossier sur le serveur (ex. `C:\Temp\Audit`).
+   [Coreinfo](https://learn.microsoft.com/sysinternals/downloads/coreinfo) (vérification formelle
+   de SSE4.2/POPCNT) est **téléchargé automatiquement** depuis Sysinternals et n'est exécuté que si
+   sa signature Microsoft est valide. Serveur sans Internet : déposer `Coreinfo64.exe` à côté du
+   script (ou `-NoDownload` pour ne rien tenter).
 2. Débloquer les fichiers téléchargés depuis GitHub :
    ```powershell
    Get-ChildItem C:\Temp\Audit | Unblock-File
@@ -52,6 +59,28 @@ brutes (CSV, JSON, sorties d'outils) pour la documentation.
    .\Merge-AuditReports.ps1 -Path D:\Cadrage\Client\Audits
    ```
 
+### Ce que vous voyez dans la console
+
+```
+14:32:22 [HEAD] [ 2/22] [Hardware] Matériel et prérequis Windows Server 2025
+14:32:22 [STEP]    > Jeux d'instructions CPU
+14:32:22 [INFO]    Téléchargement de Coreinfo : https://download.sysinternals.com/files/Coreinfo.zip
+14:32:24 [OK  ]    Coreinfo téléchargé, signature Microsoft valide (CN=Microsoft Corporation, ...)
+14:32:24 [DBG ]       exec : C:\AuditPreUpgrade\...\tools\Coreinfo64.exe -accepteula -f
+14:32:25 [DBG ]       exec : Coreinfo64.exe terminé en 0.6 s (code 0)
+14:32:25 [FIND]       -> [CRITIQUE] Espace libre insuffisant sur C: (18 Go)
+14:32:26 [WARN]    ! ÉCHEC TPM : Accès refusé (ligne 612)
+14:32:26 [WARN]    = [Hardware] terminé en 3.9 s : 1 constat(s), 1 erreur(s) de collecte
+...
+[WARN] RÉCAPITULATIF : 2 section(s) avec erreurs de collecte (données partielles) :
+[WARN] Points CRITIQUE / ÉLEVÉ à traiter :
+```
+
+Chaque section affiche sa progression, chaque sous-étape, chaque commande externe (durée, code
+retour, délai dépassé), chaque constat au moment où il est détecté (en couleur), puis un
+**récapitulatif final** des erreurs de collecte et des points CRITIQUE/ÉLEVÉ. Tout est aussi
+écrit dans `audit.log`.
+
 Durée typique : 2 à 10 min par serveur (plus sur un DC avec `dcdiag` et un grand annuaire,
 ou un RDS avec beaucoup de profils — utiliser `-Quick` si besoin).
 
@@ -64,7 +93,8 @@ ou un RDS avec beaucoup de profils — utiliser `-Quick` si besoin).
 | `-StaleDays 180` | Seuil d'inactivité des comptes AD (défaut 90 j) |
 | `-Quick` | Pas de calcul de taille des profils, pas de `dcdiag /test:dns`, pas de rapport GPO HTML complet |
 | `-SkipSection Events,Software` | Ignorer des sections |
-| `-CoreinfoPath C:\Tools\Coreinfo64.exe` | Vérification SSE4.2/POPCNT par Coreinfo |
+| `-CoreinfoPath C:\Tools\Coreinfo64.exe` | Utiliser un Coreinfo déjà présent |
+| `-NoDownload` | Ne pas télécharger Coreinfo (serveur isolé) |
 | `-SetupMediaPath D:\` | Lance aussi le **scan de compatibilité officiel Microsoft** (`setup.exe /auto upgrade /compat scanonly`) avec l'ISO WS2025 montée. Crée `C:\$WINDOWS.~BT` mais n'installe rien. 10 à 40 min. |
 | `-SetupImageIndex 2` | Index d'image du média (1 Std Core, 2 Std Bureau, 3 DC Core, 4 DC Bureau) — déduit sinon |
 | `-NoZip` | Pas d'archive |
@@ -124,6 +154,20 @@ disques (pass-through, différenciation, fragmentation, **surallocation**), cart
 ISO montées, services d'intégration, **OS invités via KVP**, checkpoints, Réplica, **vTPM**
 (certificats à exporter), capacité mémoire, cluster.
 
+**Usage réel des protocoles hérités** (journaux, pas seulement la configuration) : qui utilise
+encore **NTLMv1** (4624, supprimé dans WS2025) et NTLM, quels clients font des **binds LDAP non
+signés** (2887/2889), quels services reçoivent des tickets **Kerberos RC4/DES** (4769). C'est ce qui
+cassera après la migration ou le durcissement.
+
+## Avant / après : comparaison
+
+```powershell
+.\Compare-AuditReports.ps1 -Before .\Audit_SRV-AD01_20261105_0900.zip -After .\Audit_SRV-AD01_20261120_1400.zip
+```
+Produit `Comparaison_<HOTE>.html/.csv` : constats résolus / nouveaux / persistants, compteurs par
+sévérité, informations clés modifiées (build, rôles, schéma…), tableaux dont le volume a changé.
+Idéal pour prouver au client l'effet de la remédiation puis de la migration.
+
 ## Sorties
 
 ```
@@ -133,6 +177,7 @@ C:\AuditPreUpgrade\Audit_<HOTE>_<yyyyMMdd_HHmm>\
 ├── audit.json            ← données structurées (consolidation)
 ├── audit.log             ← journal d'exécution
 ├── csv\                  ← un CSV par tableau du rapport
+├── tools\                ← Coreinfo téléchargé (si applicable)
 └── raw\                  ← dcdiag, repadmin, gpresult.html, GPO_AllReport.html, dhcp_export.xml…
 ```
 
@@ -148,6 +193,14 @@ Sévérités : **CRITIQUE** (bloque l'upgrade ou risque majeur) · **ÉLEVÉ** (
   les transmettre de façon chiffrée et les supprimer des serveurs après récupération.
 - Aucun mot de passe ni secret n'est collecté (les exports DHCP et secedit ne contiennent pas de secrets).
 
+## Tests et CI
+
+- `tests/Invoke-SmokeTest.ps1` (PowerShell 7, tout OS) : syntaxe de tous les scripts, puis audit
+  complet contre des modules **AD / Hyper-V / RDS / DNS / DHCP / GPO simulés** décrivant un serveur
+  « à problèmes », avec vérification des constats attendus, de la consolidation et de la comparaison.
+- GitHub Actions : ce test de fumée, PSScriptAnalyzer sous Windows PowerShell 5.1, et une
+  **exécution réelle** du script sur un runner Windows Server (rapport publié en artefact).
+
 ## Compatibilité
 
 Windows PowerShell 5.1, Windows Server 2016 / 2019 / 2022 / 2025 (conçu pour 2019).
@@ -161,6 +214,20 @@ Chaque collecteur est isolé : une erreur est consignée dans la section concern
 - [Niveaux fonctionnels AD DS](https://learn.microsoft.com/windows-server/identity/ad-ds/active-directory-functional-levels)
 - [Mise à niveau sur place de Windows Server](https://learn.microsoft.com/windows-server/get-started/perform-in-place-upgrade)
 - [Prérequis matériels Windows Server 2025](https://learn.microsoft.com/windows-server/get-started/hardware-requirements)
+
+## Personnalisation (fork / réutilisation)
+
+Le dépôt ne contient aucune donnée personnelle : les valeurs ci-dessous sont génériques et
+chacun les remplace par les siennes.
+
+| Où | Valeur générique | À remplacer par |
+|---|---|---|
+| `LICENSE` | `WS-PreUpgrade-Audit contributors` | votre nom ou celui de votre société |
+| Badge CI en haut de ce README | `jfetx/WS-PreUpgrade-Audit` | `<votre-compte>/<votre-dépôt>` |
+| Identité git (commits) | adresse `noreply` GitHub | `git config user.name "Votre Nom"` et `git config user.email "vous@exemple.com"` |
+
+Les rapports d'audit générés contiennent, eux, des données du client : ils ne doivent jamais être
+committés (voir `.gitignore`).
 
 ## Licence
 

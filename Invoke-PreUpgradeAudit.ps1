@@ -21,6 +21,8 @@
                       collections, RemoteApp, certificats, UPD/FSLogix, profils, Office.
       - Hyper-V     : hôte, vSwitch (LBFO/SET), VM, disques, checkpoints, réplication,
                       compatibilité processeur, vTPM, OS invités (KVP), surallocation.
+      - Protocoles hérités (usage RÉEL d'après les journaux) : NTLMv1/NTLM (4624),
+                      LDAP non signé (2887/2889), Kerberos RC4/DES (4769).
 
     Sorties (dans -OutputPath\Audit_<HOTE>_<date>) :
       Rapport_<HOTE>.html  rapport lisible avec synthèse, points d'attention et verdict
@@ -30,6 +32,14 @@
       raw\*.txt|html       sorties brutes des outils (dcdiag, repadmin, gpresult...)
       audit.log            journal d'exécution
       + archive ZIP de l'ensemble (sauf -NoZip)
+
+    Console : affichage détaillé en temps réel (sections [n/22], sous-étapes, commandes
+    externes avec durée et code retour, constats au fil de l'eau) puis récapitulatif des
+    erreurs de collecte et des points CRITIQUE/ÉLEVÉ en fin d'exécution.
+
+    Coreinfo (Sysinternals) est téléchargé automatiquement dans le dossier de sortie
+    s'il est absent (désactivable : -NoDownload) ; il n'est exécuté que si sa signature
+    Authenticode Microsoft est valide.
 
     Le script ne modifie AUCUN paramètre. Seule exception, uniquement si
     -SetupMediaPath est fourni : lancement du scan de compatibilité officiel
@@ -55,7 +65,13 @@
 
 .PARAMETER CoreinfoPath
     Chemin vers Coreinfo64.exe (Sysinternals) pour vérifier formellement
-    SSE4.2/POPCNT. Si absent, le script cherche Coreinfo64.exe à côté de lui.
+    SSE4.2/POPCNT. Ordre de recherche : ce paramètre, puis à côté du script,
+    puis téléchargement automatique (sauf -NoDownload).
+
+.PARAMETER NoDownload
+    N'essaie pas de télécharger Coreinfo depuis Sysinternals (serveur sans Internet).
+    Par défaut, si Coreinfo64.exe est absent, il est téléchargé dans le dossier
+    de sortie (tools\), sa signature Microsoft est vérifiée, puis il est exécuté.
 
 .PARAMETER SkipSection
     Sections à ignorer (ex. -SkipSection Events,Software).
@@ -87,9 +103,10 @@ param(
     [string]$SetupMediaPath,
     [ValidateRange(0, 16)][int]$SetupImageIndex = 0,
     [string]$CoreinfoPath,
+    [switch]$NoDownload,
     [ValidateSet('System', 'Hardware', 'Storage', 'Network', 'Features', 'Updates', 'Software', 'Security',
         'Policies', 'Events', 'ActiveDirectory', 'GPO', 'DNS', 'DHCP', 'RDS', 'HyperV', 'Guest',
-        'OtherRoles', 'Printing', 'Backup', 'SetupCompat')]
+        'OtherRoles', 'Printing', 'Backup', 'LegacyAuth', 'SetupCompat')]
     [string[]]$SkipSection = @(),
     [switch]$Quick,
     [switch]$NoZip
@@ -100,7 +117,7 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
 #region ===================== Initialisation =====================
-$Script:AuditVersion = '1.0.0'
+$Script:AuditVersion = '1.1.0'
 $Script:Start = Get-Date
 $Script:HostName = $env:COMPUTERNAME
 if (-not $Script:HostName) { $Script:HostName = [System.Net.Dns]::GetHostName() }
@@ -114,6 +131,8 @@ $Script:LogFile = Join-Path $Script:RunFolder 'audit.log'
 $Script:Sections = New-Object System.Collections.Generic.List[object]
 $Script:Findings = New-Object System.Collections.Generic.List[object]
 $Script:Current = $null
+$Script:Progress = ''
+$Script:ExternalLog = New-Object System.Collections.Generic.List[object]
 $Script:Facts = @{}          # faits partagés entre collecteurs (ex. logiciels détectés)
 $Script:SeverityOrder = @{ 'Critique' = 0; 'Eleve' = 1; 'Moyen' = 2; 'Faible' = 3; 'Info' = 4 }
 $Script:SeverityLabel = @{ 'Critique' = 'CRITIQUE'; 'Eleve' = 'ÉLEVÉ'; 'Moyen' = 'MOYEN'; 'Faible' = 'FAIBLE'; 'Info' = 'INFO' }
@@ -121,9 +140,10 @@ $Script:SeverityLabel = @{ 'Critique' = 'CRITIQUE'; 'Eleve' = 'ÉLEVÉ'; 'Moyen'
 
 #region ===================== Fonctions utilitaires =====================
 function Write-Log {
-    param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERR', 'OK')][string]$Level = 'INFO')
-    $line = '{0} [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Message
-    $color = @{ INFO = 'Gray'; WARN = 'Yellow'; ERR = 'Red'; OK = 'Green' }[$Level]
+    param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERR', 'OK', 'STEP', 'DBG', 'FIND', 'HEAD')][string]$Level = 'INFO', [string]$Color)
+    $line = '{0} [{1,-4}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Message
+    if (-not $Color) { $Color = @{ INFO = 'Gray'; WARN = 'Yellow'; ERR = 'Red'; OK = 'Green'; STEP = 'DarkGray'; DBG = 'DarkGray'; FIND = 'White'; HEAD = 'Cyan' }[$Level] }
+    $color = $Color
     Write-Host $line -ForegroundColor $color
     try { Add-Content -Path $Script:LogFile -Value $line -Encoding UTF8 } catch { }
 }
@@ -243,6 +263,8 @@ function Add-Finding {
             Detail         = $Detail
             Recommendation = $Recommendation
         })
+    $fc = @{ Critique = 'Red'; Eleve = 'DarkYellow'; Moyen = 'Yellow'; Faible = 'DarkCyan'; Info = 'DarkGray' }[$Severity]
+    Write-Log ('      -> [{0}] {1}' -f $Script:SeverityLabel[$Severity], $Title) 'FIND' $fc
 }
 
 function Invoke-External {
@@ -260,18 +282,29 @@ function Invoke-External {
             $enc = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
             $psi.StandardOutputEncoding = $enc; $psi.StandardErrorEncoding = $enc
         } catch { }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Write-Log ('      exec : {0} {1}' -f $FilePath, $Arguments) 'DBG'
         $p = [System.Diagnostics.Process]::Start($psi)
         $o = $p.StandardOutput.ReadToEndAsync()
         $e = $p.StandardError.ReadToEndAsync()
         if (-not $p.WaitForExit($TimeoutSec * 1000)) {
             try { $p.Kill() } catch { }
+            Write-Log ('      ! {0} {1} : délai de {2} s dépassé, processus arrêté' -f $FilePath, $Arguments, $TimeoutSec) 'WARN'
+            $Script:ExternalLog.Add([pscustomobject]@{ Commande = "$FilePath $Arguments"; 'Durée (s)' = $TimeoutSec; Code = 'TIMEOUT' })
+            if ($Script:Current) { $Script:Current.Errors.Add("Délai dépassé : $FilePath $Arguments") }
             return "[DÉLAI DÉPASSÉ après $TimeoutSec s : $FilePath $Arguments]`r`n" + $o.Result
         }
         $p.WaitForExit()
+        $sw.Stop()
+        $lvl = if ($p.ExitCode -ne 0) { 'WARN' } else { 'DBG' }
+        Write-Log ('      exec : {0} terminé en {1:N1} s (code {2})' -f (Split-Path $FilePath -Leaf), $sw.Elapsed.TotalSeconds, $p.ExitCode) $lvl
+        $Script:ExternalLog.Add([pscustomobject]@{ Commande = "$FilePath $Arguments"; 'Durée (s)' = [math]::Round($sw.Elapsed.TotalSeconds, 1); Code = $p.ExitCode })
         $txt = $o.Result
         if ($e.Result) { $txt += "`r`n[stderr]`r`n" + $e.Result }
         return $txt
     } catch {
+        Write-Log ('      ! impossible d''exécuter {0} : {1}' -f $FilePath, $_.Exception.Message) 'WARN'
+        if ($Script:Current) { $Script:Current.Errors.Add("Exécution impossible : $FilePath ($($_.Exception.Message))") }
         return "[ERREUR exécution $FilePath $Arguments : $($_.Exception.Message)]"
     }
 }
@@ -280,18 +313,25 @@ function Invoke-Step {
     <# Exécute une sous-étape : toute erreur est consignée dans la section sans interrompre l'audit. #>
     param([string]$Name, [scriptblock]$Script)
     $ErrorActionPreference = 'Stop'
-    try { $null = & $Script }
+    Write-Log ('   > {0}' -f $Name) 'STEP'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $null = & $Script
+        $sw.Stop()
+        if ($sw.Elapsed.TotalSeconds -ge 5) { Write-Log ('   < {0} ({1:N1} s)' -f $Name, $sw.Elapsed.TotalSeconds) 'STEP' }
+    }
     catch {
         $msg = '{0} : {1} (ligne {2})' -f $Name, $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber
         if ($Script:Current) { $Script:Current.Errors.Add($msg) }
-        Write-Log "   ! $msg" 'WARN'
+        Write-Log "   ! ÉCHEC $msg" 'WARN'
     }
 }
 
 function Invoke-Collector {
     param([string]$Id, [string]$Title, [scriptblock]$Body, [bool]$When = $true)
-    if ($SkipSection -contains $Id) { Write-Log "[$Id] ignorée (-SkipSection)"; return }
-    if (-not $When) { return }
+    if ($SkipSection -contains $Id) { Write-Log "$($Script:Progress) [$Id] ignorée (-SkipSection)" 'WARN'; return }
+    if (-not $When) { Write-Log "$($Script:Progress) [$Id] non applicable (rôle non détecté)" 'DBG'; return }
+    $fBefore = $Script:Findings.Count
     $sec = [pscustomobject]@{
         Id          = $Id
         Title       = $Title
@@ -300,12 +340,16 @@ function Invoke-Collector {
         DurationSec = 0
     }
     $Script:Current = $sec
-    Write-Log "[$Id] $Title ..."
+    Write-Host ''
+    Write-Log "$($Script:Progress) [$Id] $Title" 'HEAD'
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try { $null = & $Body }
     catch { $m = '{0} (ligne {1})' -f $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber; $sec.Errors.Add("Erreur collecteur : $m"); Write-Log "   ! $m" 'ERR' }
     $sw.Stop()
     $sec.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+    $nf = $Script:Findings.Count - $fBefore
+    $lvl = if ($sec.Errors.Count) { 'WARN' } else { 'OK' }
+    Write-Log ('   = [{0}] terminé en {1} s : {2} constat(s), {3} erreur(s) de collecte' -f $Id, $sec.DurationSec, $nf, $sec.Errors.Count) $lvl
     $Script:Sections.Add($sec)
     $Script:Current = $null
 }
@@ -330,6 +374,59 @@ function Get-OSLanguageName {
     try { return [System.Globalization.CultureInfo]::GetCultureInfo([int]$Lcid).Name } catch { return "$Lcid" }
 }
 #endregion
+
+function Get-CoreinfoPath {
+    <#
+      Retourne le chemin d'un Coreinfo64.exe utilisable :
+      1) -CoreinfoPath  2) à côté du script  3) téléchargement Sysinternals (sauf -NoDownload)
+      Le binaire téléchargé n'est exécuté que si sa signature Authenticode est valide ET émise pour Microsoft.
+    #>
+    if ($CoreinfoPath) {
+        if (Test-Path $CoreinfoPath) { Write-Log "   Coreinfo fourni : $CoreinfoPath" 'DBG'; return $CoreinfoPath }
+        Write-Log "   -CoreinfoPath introuvable : $CoreinfoPath" 'WARN'
+    }
+    if ($PSScriptRoot) {
+        foreach ($c in @((Join-Path $PSScriptRoot 'Coreinfo64.exe'), (Join-Path $PSScriptRoot 'Coreinfo.exe'))) {
+            if (Test-Path $c) { Write-Log "   Coreinfo trouvé à côté du script : $c" 'DBG'; return $c }
+        }
+    }
+    if ($NoDownload) { Write-Log '   Coreinfo absent et -NoDownload : vérification SSE4.2/POPCNT par l''API Windows uniquement.' 'WARN'; return $null }
+
+    $dir = Join-Path $Script:RunFolder 'tools'
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $exe = Join-Path $dir 'Coreinfo64.exe'
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    $sources = @(
+        @{ Url = 'https://download.sysinternals.com/files/Coreinfo.zip'; Zip = $true },
+        @{ Url = 'https://live.sysinternals.com/Coreinfo64.exe'; Zip = $false }
+    )
+    foreach ($s in $sources) {
+        try {
+            Write-Log "   Téléchargement de Coreinfo : $($s.Url)" 'INFO'
+            $target = if ($s.Zip) { Join-Path $dir 'Coreinfo.zip' } else { $exe }
+            $iwr = @{ Uri = $s.Url; OutFile = $target; UseBasicParsing = $true; TimeoutSec = 30; ErrorAction = 'Stop' }
+            if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey('ProxyUseDefaultCredentials')) {
+                $proxy = [System.Net.WebRequest]::GetSystemWebProxy().GetProxy([uri]$s.Url)
+                if ($proxy -and $proxy.AbsoluteUri -ne $s.Url) { $iwr.Proxy = $proxy.AbsoluteUri; $iwr.ProxyUseDefaultCredentials = $true; Write-Log "   via proxy $($proxy.AbsoluteUri)" 'DBG' }
+            }
+            Invoke-WebRequest @iwr
+            if ($s.Zip) { Expand-Archive -Path $target -DestinationPath $dir -Force -ErrorAction Stop }
+            if (Test-Path $exe) { break }
+        } catch { Write-Log "   ! Échec du téléchargement ($($s.Url)) : $($_.Exception.Message)" 'WARN' }
+    }
+    if (-not (Test-Path $exe)) {
+        Write-Log '   Coreinfo indisponible (pas d''accès Internet ?). Copier Coreinfo64.exe à côté du script pour une vérification formelle.' 'WARN'
+        return $null
+    }
+    $sig = Get-AuthenticodeSignature -FilePath $exe
+    if ($sig.Status -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch 'O=Microsoft Corporation') {
+        Write-Log ("   ! Signature de Coreinfo64.exe NON valide ({0} / {1}) : fichier supprimé, non exécuté." -f $sig.Status, $sig.SignerCertificate.Subject) 'ERR'
+        Remove-Item $exe -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    Write-Log ("   Coreinfo téléchargé, signature Microsoft valide ({0})" -f $sig.SignerCertificate.Subject) 'OK'
+    return $exe
+}
 
 #region ===================== Contexte et détection des rôles =====================
 function Initialize-Context {
@@ -491,21 +588,23 @@ function Invoke-HardwareCollector {
         }
 
         Invoke-Step 'Jeux d''instructions CPU' {
-            if (-not ('AuditNative.Cpu' -as [type])) {
-                Add-Type -Namespace AuditNative -Name Cpu -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(uint ProcessorFeature);' -ErrorAction Stop
-            }
-            $pf = [ordered]@{ 'SSE2' = 10; 'NX / DEP' = 12; 'SSE3' = 13; 'CMPXCHG16B' = 14; 'SLAT' = 20; 'Virtualisation firmware' = 21; 'SSSE3' = 36; 'SSE4.1' = 37; 'SSE4.2' = 38; 'AVX' = 39; 'AVX2' = 40 }
             $res = [ordered]@{}
-            $rows = foreach ($k in $pf.Keys) { $v = [AuditNative.Cpu]::IsProcessorFeaturePresent([uint32]$pf[$k]); $res[$k] = $v; [pscustomobject]@{ Instruction = $k; 'Constante PF' = $pf[$k]; 'Présente (API)' = $v } }
-            Add-Table 'Instructions CPU (IsProcessorFeaturePresent)' $rows -Note 'Sur WS2019, les constantes ≥ 36 peuvent ne pas être reconnues par le noyau (réponse False par défaut) : un False sur SSSE3/SSE4.x/AVX n''est donc pas forcément une absence réelle. Coreinfo fait foi.'
+            try {
+                if (-not ('AuditNative.Cpu' -as [type])) {
+                    Add-Type -Namespace AuditNative -Name Cpu -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(uint ProcessorFeature);' -ErrorAction Stop
+                }
+                $pf = [ordered]@{ 'SSE2' = 10; 'NX / DEP' = 12; 'SSE3' = 13; 'CMPXCHG16B' = 14; 'SLAT' = 20; 'Virtualisation firmware' = 21; 'SSSE3' = 36; 'SSE4.1' = 37; 'SSE4.2' = 38; 'AVX' = 39; 'AVX2' = 40 }
+                $rows = foreach ($k in $pf.Keys) { $v = [AuditNative.Cpu]::IsProcessorFeaturePresent([uint32]$pf[$k]); $res[$k] = $v; [pscustomobject]@{ Instruction = $k; 'Constante PF' = $pf[$k]; 'Présente (API)' = $v } }
+                Add-Table 'Instructions CPU (IsProcessorFeaturePresent)' $rows -Note 'Sur WS2019, les constantes ≥ 36 peuvent ne pas être reconnues par le noyau (réponse False par défaut) : un False sur SSSE3/SSE4.x/AVX n''est donc pas forcément une absence réelle. Coreinfo fait foi.'
+            } catch {
+                Write-Log "   ! API IsProcessorFeaturePresent indisponible : $($_.Exception.Message)" 'WARN'
+                $Script:Current.Errors.Add("API IsProcessorFeaturePresent : $($_.Exception.Message)")
+            }
 
             $sse42 = $null; $popcnt = $null; $src = 'API Windows'
-            $ci = $CoreinfoPath
-            if (-not $ci) {
-                foreach ($c in @((Join-Path $PSScriptRoot 'Coreinfo64.exe'), (Join-Path $PSScriptRoot 'Coreinfo.exe'))) { if ($PSScriptRoot -and (Test-Path $c)) { $ci = $c; break } }
-            }
-            if ($ci -and (Test-Path $ci)) {
-                $out = Invoke-External $ci '-accepteula -f -nobanner' 60
+            $ci = Get-CoreinfoPath
+            if ($ci) {
+                $out = Invoke-External $ci '-accepteula -f' 60
                 Add-Raw 'Coreinfo -f' $out 'coreinfo.txt'
                 if ($out -match '(?m)^SSE4\.2\s+([\*\-])') { $sse42 = ($Matches[1] -eq '*'); $src = 'Coreinfo' }
                 if ($out -match '(?m)^POPCNT\s+([\*\-])') { $popcnt = ($Matches[1] -eq '*') }
@@ -519,7 +618,7 @@ function Invoke-HardwareCollector {
             if ($sse42 -eq $false -or $popcnt -eq $false) {
                 Add-Finding Critique 'Prérequis CPU' 'SSE4.2 / POPCNT non exposés au système' "Source : $src. WS2025 exige SSE4.2 et POPCNT : l'installation/upgrade échoue ou le système ne démarre pas." $(if ($Script:VMPlatform -eq 'Hyper-V') { 'Sur l''hôte Hyper-V : VM éteinte, Set-VMProcessor -CompatibilityForMigrationEnabled $false, puis revérifier.' } else { 'Vérifier le CPU / le masquage d''instructions (mode compatibilité EVC/migration de l''hyperviseur).' })
             } elseif ($null -eq $sse42) {
-                Add-Finding Moyen 'Prérequis CPU' 'Présence de SSE4.2 / POPCNT non confirmée' 'L''API de WS2019 ne permet pas de conclure. WS2025 exige SSE4.2 et POPCNT (CPU post-2008 en général, mais masquables en VM).' 'Lancer Coreinfo64.exe -f (Sysinternals) à côté du script ou via -CoreinfoPath ; sur VM Hyper-V vérifier que la compatibilité processeur pour la migration est désactivée.'
+                Add-Finding Moyen 'Prérequis CPU' 'Présence de SSE4.2 / POPCNT non confirmée' 'L''API de WS2019 ne permet pas de conclure et Coreinfo n''a pas pu être téléchargé/exécuté (pas d''accès Internet ?). WS2025 exige SSE4.2 et POPCNT (CPU post-2008 en général, mais masquables en VM).' 'Copier Coreinfo64.exe (Sysinternals) à côté du script et relancer, ou exécuter « Coreinfo64.exe -accepteula -f » ; sur VM Hyper-V vérifier que la compatibilité processeur pour la migration est désactivée.'
             }
         }
 
@@ -797,7 +896,8 @@ function Invoke-UpdatesCollector {
         Invoke-Step 'Santé du magasin de composants' {
             $o = Invoke-External 'dism.exe' '/Online /Cleanup-Image /CheckHealth' 180
             Add-Raw 'DISM /CheckHealth' $o 'dism_checkhealth.txt'
-            if ($o -match 'repairable|réparable|corrupt|endommag') { Add-Finding Eleve 'Mises à jour' 'Magasin de composants Windows endommagé (DISM CheckHealth)' '' 'Exécuter DISM /Online /Cleanup-Image /RestoreHealth puis sfc /scannow avant l''upgrade.' }
+            # « No component store corruption detected » / « Aucun endommagement » = cas sain : ne pas matcher corrupt/endommag
+            if ($o -match 'is repairable|not repairable|peut .tre r.par|n.est pas r.parable') { Add-Finding Eleve 'Mises à jour' 'Magasin de composants Windows endommagé (DISM CheckHealth)' '' 'Exécuter DISM /Online /Cleanup-Image /RestoreHealth puis sfc /scannow avant l''upgrade.' }
         }
     }
 }
@@ -1060,6 +1160,87 @@ function Invoke-EventsCollector {
                 Add-Table 'Échecs 4625 par compte (top 25)' ($parsed | Group-Object Compte | Sort-Object Count -Descending | Select-Object -First 25 | Select-Object @{n = 'Compte'; e = { $_.Name } }, @{n = 'Échecs'; e = { $_.Count } })
                 if ($f.Count -gt 500) { Add-Finding Eleve 'Sécurité' "$($f.Count) échecs d'ouverture de session en $EventDays jours" 'Indice d''attaque par force brute (RDP/SMB exposé ?).' 'Vérifier l''exposition Internet (RDP derrière VPN/RD Gateway + MFA), le verrouillage de compte, et les IP sources.' }
             } else { Add-Note 'Aucun 4625 trouvé (ou audit des échecs d''ouverture de session non activé).' }
+        }
+    }
+}
+#endregion
+
+#region ===================== Usage réel des protocoles hérités =====================
+function Get-EventDataTable {
+    <# Convertit les événements en objets (EventData Name -> valeur). #>
+    param($Events)
+    foreach ($e in $Events) {
+        $h = [ordered]@{ Date = $e.TimeCreated }
+        try {
+            $x = [xml]$e.ToXml()
+            foreach ($n in $x.Event.EventData.Data) { if ($n.Name) { $h[$n.Name] = $n.'#text' } }
+        } catch { }
+        [pscustomobject]$h
+    }
+}
+
+function Invoke-LegacyAuthCollector {
+    Invoke-Collector -Id 'LegacyAuth' -Title "Usage réel des protocoles hérités (NTLMv1, NTLM, LDAP non signé, Kerberos RC4/DES)" -Body {
+        Add-Note ("Analyse des {0} derniers jours de journaux. Contrairement à la section Sécurité (configuration), cette section montre QUI utilise encore ces protocoles et cassera après le passage à WS2025 / au durcissement." -f $EventDays)
+        $sinceMs = [int64]$EventDays * 86400000
+        $max = if ($Quick) { 5000 } else { 50000 }
+
+        Invoke-Step 'NTLMv1 (4624)' {
+            $xp = "*[System[(EventID=4624) and TimeCreated[timediff(@SystemTime) <= $sinceMs]] and EventData[Data[@Name='LmPackageName']='NTLM V1']]"
+            $ev = @(Get-WinEvent -LogName Security -FilterXPath $xp -MaxEvents $max -ErrorAction SilentlyContinue)
+            if ($ev.Count) {
+                $rows = Get-EventDataTable $ev
+                Add-Table 'Ouvertures de session NTLMv1 (top sources)' ($rows | Group-Object WorkstationName, IpAddress, TargetUserName | Sort-Object Count -Descending | Select-Object -First 50 | ForEach-Object {
+                        $f = $_.Group[0]; [pscustomobject]@{ 'Poste source' = $f.WorkstationName; 'IP source' = $f.IpAddress; Compte = ('{0}\{1}' -f $f.TargetDomainName, $f.TargetUserName); Occurrences = $_.Count; 'Dernière' = ($_.Group | Sort-Object Date -Descending | Select-Object -First 1).Date }
+                    })
+                Add-Finding Eleve 'Compatibilité' "NTLMv1 encore utilisé ($($ev.Count) ouvertures de session en $EventDays j)" ((($rows | Select-Object -ExpandProperty WorkstationName -Unique) | Select-Object -First 10) -join ', ') 'NTLMv1 est supprimé dans WS2025 : mettre à jour/reconfigurer ces clients (LmCompatibilityLevel ≥ 3 côté client, firmware des équipements) avant la migration.'
+            } else { Add-Note 'Aucune ouverture de session NTLMv1 détectée (4624, LmPackageName = NTLM V1) — ou audit des ouvertures de session non activé.' }
+        }
+
+        Invoke-Step 'NTLM (toutes versions)' {
+            $xp = "*[System[(EventID=4624) and TimeCreated[timediff(@SystemTime) <= $sinceMs]] and EventData[Data[@Name='AuthenticationPackageName']='NTLM'] and EventData[Data[@Name='LogonType']!='5']]"
+            $ev = @(Get-WinEvent -LogName Security -FilterXPath $xp -MaxEvents $max -ErrorAction SilentlyContinue)
+            if ($ev.Count) {
+                $rows = Get-EventDataTable $ev
+                Add-Table 'Ouvertures de session NTLM (top 30 sources)' ($rows | Group-Object WorkstationName, IpAddress, LmPackageName | Sort-Object Count -Descending | Select-Object -First 30 | ForEach-Object {
+                        $f = $_.Group[0]; [pscustomobject]@{ 'Poste source' = $f.WorkstationName; 'IP source' = $f.IpAddress; Version = $f.LmPackageName; 'Comptes (ex.)' = (($_.Group.TargetUserName | Select-Object -Unique -First 5) -join ', '); Occurrences = $_.Count }
+                    }) -Note $(if ($ev.Count -ge $max) { "Limité aux $max événements les plus récents." } else { '' })
+                Add-Finding Info 'Compatibilité' "NTLM utilisé ($($ev.Count) ouvertures de session réseau en $EventDays j)" 'NTLM (toutes versions) est déprécié par Microsoft ; WS2025 permet de le bloquer progressivement (SMB, etc.).' 'Identifier les flux NTLM (accès par IP, applications anciennes) et privilégier Kerberos (noms DNS, SPN corrects).'
+            }
+        }
+
+        if ($Script:Roles.IsDC) {
+            Invoke-Step 'LDAP non signé (2887/2889)' {
+                $s = Get-WinEvent -FilterHashtable @{ LogName = 'Directory Service'; Id = 2887; StartTime = (Get-Date).AddDays(-$EventDays) } -MaxEvents 30 -ErrorAction SilentlyContinue
+                if ($s) {
+                    $rows = foreach ($e in $s) { [pscustomobject]@{ Date = $e.TimeCreated; 'Binds simples sans SSL/TLS' = $e.Properties[0].Value; 'Binds SASL sans signature' = $e.Properties[1].Value } }
+                    Add-Table 'Synthèse quotidienne des binds LDAP non sécurisés (2887)' $rows
+                    $tot = ($rows | Measure-Object 'Binds simples sans SSL/TLS' -Sum).Sum + ($rows | Measure-Object 'Binds SASL sans signature' -Sum).Sum
+                    if ($tot -gt 0) { Add-Finding Eleve 'Compatibilité' "Binds LDAP non signés / en clair : $tot sur $EventDays j (événement 2887)" 'Des clients (copieurs, NAS, firewall, applications) s''authentifient en LDAP simple ou non signé.' 'Activer le diagnostic (HKLM\SYSTEM\CurrentControlSet\Services\NTDS\Diagnostics "16 LDAP Interface Events" = 2) pour obtenir les IP clientes (événement 2889), les passer en LDAPS (636) ou LDAP signé, puis exiger la signature.' }
+                }
+                $d = Get-WinEvent -FilterHashtable @{ LogName = 'Directory Service'; Id = 2889; StartTime = (Get-Date).AddDays(-$EventDays) } -MaxEvents 5000 -ErrorAction SilentlyContinue
+                if ($d) {
+                    $rows = foreach ($e in $d) { [pscustomobject]@{ IP = ("$($e.Properties[0].Value)" -replace ':\d+$', ''); Compte = $e.Properties[1].Value; Type = $e.Properties[2].Value } }
+                    Add-Table 'Clients LDAP non signés (2889, diagnostic activé)' ($rows | Group-Object IP, Compte | Sort-Object Count -Descending | Select-Object -First 50 | ForEach-Object { [pscustomobject]@{ 'IP client' = $_.Group[0].IP; Compte = $_.Group[0].Compte; 'Type de bind (0=SASL non signé,1=simple)' = $_.Group[0].Type; Occurrences = $_.Count } })
+                } elseif ($s) { Add-Note 'Pas d''événement 2889 : le diagnostic LDAP n''est pas activé, les IP clientes ne sont pas connues.' }
+            }
+            Invoke-Step 'Kerberos RC4 / DES (4769)' {
+                $xp = "*[System[(EventID=4769) and TimeCreated[timediff(@SystemTime) <= $sinceMs]] and EventData[(Data[@Name='TicketEncryptionType']='0x17' or Data[@Name='TicketEncryptionType']='0x18' or Data[@Name='TicketEncryptionType']='0x1' or Data[@Name='TicketEncryptionType']='0x3')]]"
+                $ev = @(Get-WinEvent -LogName Security -FilterXPath $xp -MaxEvents $max -ErrorAction SilentlyContinue)
+                if ($ev.Count) {
+                    $enc = @{ '0x17' = 'RC4'; '0x18' = 'RC4-EXP'; '0x1' = 'DES-CBC-CRC'; '0x3' = 'DES-CBC-MD5' }
+                    $rows = Get-EventDataTable $ev
+                    Add-Table 'Tickets de service Kerberos en RC4/DES (top 50)' ($rows | Group-Object ServiceName, IpAddress, TicketEncryptionType | Sort-Object Count -Descending | Select-Object -First 50 | ForEach-Object {
+                            $f = $_.Group[0]; [pscustomobject]@{ Service = $f.ServiceName; 'Client (IP)' = ("$($f.IpAddress)" -replace '^::ffff:', ''); Compte = $f.TargetUserName; Chiffrement = $enc["$($f.TicketEncryptionType)"]; Occurrences = $_.Count }
+                        })
+                    $des = @($rows | Where-Object { $_.TicketEncryptionType -in '0x1', '0x3' })
+                    Add-Finding $(if ($des.Count) { 'Eleve' } else { 'Moyen' }) 'Compatibilité' "Kerberos RC4/DES encore utilisé ($($ev.Count) tickets en $EventDays j)" ((($rows | Select-Object -ExpandProperty ServiceName -Unique) | Select-Object -First 10) -join ', ') 'Microsoft durcit progressivement Kerberos (RC4 en voie de désactivation par défaut, DES déjà désactivé). Passer les comptes de service concernés en AES (msDS-SupportedEncryptionTypes = 0x18, puis changement de mot de passe) et vérifier les comptes anciens (mot de passe antérieur au niveau fonctionnel 2008).'
+                } else { Add-Note 'Aucun ticket Kerberos RC4/DES détecté (4769) — ou audit "Kerberos Service Ticket Operations" non activé.' }
+            }
+            Invoke-Step 'Audit activé ?' {
+                $ap = Invoke-External 'auditpol.exe' '/get /subcategory:{0CCE9240-69AE-11D9-BED3-505054503030},{0CCE9215-69AE-11D9-BED3-505054503030}' 30
+                Add-Raw 'auditpol (Kerberos Service Ticket / Logon)' $ap 'auditpol_legacyauth.txt'
+            }
         }
     }
 }
@@ -2042,29 +2223,21 @@ if (-not (Test-IsAdmin)) { Write-Log 'ATTENTION : console non élevée, résulta
 Initialize-Context
 Write-Log ('Rôles détectés : ' + ((@($Script:RoleLabels.Keys | Where-Object { $Script:Roles[$_] } | ForEach-Object { $Script:RoleLabels[$_] })) -join ', '))
 
-Invoke-SystemCollector
-Invoke-HardwareCollector
-Invoke-StorageCollector
-Invoke-NetworkCollector
-Invoke-FeaturesCollector
-Invoke-UpdatesCollector
-Invoke-SoftwareCollector
-Invoke-SecurityCollector
-Invoke-PoliciesCollector
-Invoke-ADCollector
-Invoke-GPOCollector
-Invoke-DNSCollector
-Invoke-DHCPCollector
-Invoke-RDSCollector
-Invoke-HyperVCollector
-Invoke-GuestCollector
-Invoke-OtherRolesCollector
-Invoke-PrintingCollector
-Invoke-BackupCollector
-Invoke-EventsCollector
-Invoke-SetupCompatCollector
+$collectors = @(
+    'Invoke-SystemCollector', 'Invoke-HardwareCollector', 'Invoke-StorageCollector', 'Invoke-NetworkCollector',
+    'Invoke-FeaturesCollector', 'Invoke-UpdatesCollector', 'Invoke-SoftwareCollector', 'Invoke-SecurityCollector',
+    'Invoke-PoliciesCollector', 'Invoke-ADCollector', 'Invoke-GPOCollector', 'Invoke-DNSCollector', 'Invoke-DHCPCollector',
+    'Invoke-RDSCollector', 'Invoke-HyperVCollector', 'Invoke-GuestCollector', 'Invoke-OtherRolesCollector',
+    'Invoke-PrintingCollector', 'Invoke-BackupCollector', 'Invoke-EventsCollector', 'Invoke-LegacyAuthCollector',
+    'Invoke-SetupCompatCollector'
+)
+for ($i = 0; $i -lt $collectors.Count; $i++) {
+    $Script:Progress = '[{0,2}/{1}]' -f ($i + 1), $collectors.Count
+    & $collectors[$i]
+}
 
-Write-Log 'Génération du rapport...'
+Write-Host ''
+Write-Log 'Génération du rapport...' 'HEAD'
 $res = Export-AuditReport
 $zip = $null
 if (-not $NoZip) {
@@ -2077,5 +2250,19 @@ Write-Log ("Verdict : {0}" -f $res.Verdict) $(if ($res.Verdict -like 'NON*') { '
 Write-Log ("Constats : {0}" -f (($res.Counts.Keys | ForEach-Object { '{0}={1}' -f $Script:SeverityLabel[$_], $res.Counts[$_] }) -join ' | '))
 Write-Log "Rapport : $($res.Html)" 'OK'
 if ($zip) { Write-Log "Archive : $zip" 'OK' }
+
+# ---------- Récapitulatif console des problèmes de collecte ----------
+$errSecs = @($Script:Sections | Where-Object { $_.Errors.Count })
+Write-Host ''
+if ($errSecs.Count) {
+    Write-Log ("RÉCAPITULATIF : {0} section(s) avec erreurs de collecte (données partielles) :" -f $errSecs.Count) 'WARN'
+    foreach ($s in $errSecs) { foreach ($e in $s.Errors) { Write-Log ("   [{0}] {1}" -f $s.Id, $e) 'WARN' } }
+    Write-Log 'Causes fréquentes : console non élevée, module RSAT absent, compte sans droits AD, service arrêté. Détails : audit.log et section concernée du rapport.' 'INFO'
+} else { Write-Log 'RÉCAPITULATIF : aucune erreur de collecte.' 'OK' }
+$slow = @($Script:ExternalLog | Where-Object { $_.Code -eq 'TIMEOUT' -or ($_.Code -is [int] -and $_.Code -ne 0) })
+if ($slow.Count) { Write-Log ("{0} commande(s) externe(s) en échec ou en délai dépassé :" -f $slow.Count) 'WARN'; foreach ($x in $slow) { Write-Log ("   {0} -> {1}" -f $x.Commande, $x.Code) 'WARN' } }
+$crit = @($Script:Findings | Where-Object { $_.Severity -in 'Critique', 'Eleve' })
+if ($crit.Count) { Write-Log 'Points CRITIQUE / ÉLEVÉ à traiter :' 'WARN'; foreach ($f in ($crit | Sort-Object { $Script:SeverityOrder[$_.Severity] })) { Write-Log ('   [{0}] {1}' -f $Script:SeverityLabel[$f.Severity], $f.Title) 'FIND' $(if ($f.Severity -eq 'Critique') { 'Red' } else { 'DarkYellow' }) } }
+Write-Log ('Durée totale : {0:N1} min' -f ((Get-Date) - $Script:Start).TotalMinutes) 'INFO'
 [pscustomobject]@{ ComputerName = $Script:HostName; Report = $res.Html; Folder = $Script:RunFolder; Zip = $zip; Verdict = $res.Verdict }
 #endregion

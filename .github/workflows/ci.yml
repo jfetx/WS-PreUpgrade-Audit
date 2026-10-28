@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke-test:
+    name: Test de fumée (modules Windows simulés)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exécuter tests/Invoke-SmokeTest.ps1
+        shell: pwsh
+        run: ./tests/Invoke-SmokeTest.ps1
+
+  script-analyzer:
+    name: PSScriptAnalyzer (Windows PowerShell 5.1)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyse statique (erreurs bloquantes, avertissements affichés)
+        shell: powershell
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $files = Get-ChildItem -Filter *.ps1 | Select-Object -ExpandProperty FullName
+          $r = $files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Severity Error, Warning -ExcludeRule PSAvoidUsingWriteHost, PSUseShouldProcessForStateChangingFunctions, PSUseSingularNouns, PSAvoidGlobalVars }
+          $r | Sort-Object Severity, ScriptName, Line | Format-Table Severity, RuleName, ScriptName, Line, Message -AutoSize -Wrap
+          $err = @($r | Where-Object Severity -eq 'Error')
+          if ($err.Count) { Write-Error "$($err.Count) erreur(s) PSScriptAnalyzer"; exit 1 }
+      - name: Chargement sous Windows PowerShell 5.1 (sans exécution)
+        shell: powershell
+        run: |
+          foreach ($f in Get-ChildItem -Filter *.ps1) {
+            $t = $null; $e = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$t, [ref]$e)
+            if ($e) { Write-Error "$($f.Name): $($e[0].Message) L$($e[0].Extent.StartLineNumber)"; exit 1 }
+            Write-Host "OK $($f.Name)"
+          }
+
+  windows-real-run:
+    name: Exécution réelle sur runner Windows Server (PowerShell 5.1)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lancer l'audit complet (sans rôle AD/RDS/Hyper-V, mais cmdlets et binaires Windows réels)
+        shell: powershell
+        run: |
+          $r = .\Invoke-PreUpgradeAudit.ps1 -OutputPath "$env:RUNNER_TEMP\audit" -EventDays 1 -Quick | Select-Object -Last 1
+          if (-not $r -or -not (Test-Path $r.Report)) { Write-Error 'Rapport non généré'; exit 1 }
+          $j = Get-Content (Join-Path $r.Folder 'audit.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+          $errs = @($j.Sections | ForEach-Object { $s = $_; $_.Errors | ForEach-Object { "[$($s.Id)] $_" } })
+          Write-Host "Erreurs de collecte : $($errs.Count)"; $errs | ForEach-Object { Write-Host "  $_" }
+          Write-Host "Verdict : $($r.Verdict)"
+      - name: Publier le rapport en artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapport-runner-windows
+          path: ${{ runner.temp }}/audit/*.zip
