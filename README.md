@@ -3,7 +3,7 @@
 ![CI](https://github.com/jfetx/WS-PreUpgrade-Audit/actions/workflows/ci.yml/badge.svg)
 
 Kit d'audit **en lecture seule** pour migration
-**Windows Server 2019 → Windows Server 2025** : hyperviseur Hyper-V, contrôleur(s) de domaine
+**Windows Server 2019/2022 → Windows Server 2025** : hyperviseur Hyper-V, contrôleur(s) de domaine
 (AD DS / DNS / DHCP / GPO), Services Bureau à distance (RDS) et rôles courants.
 
 Un seul script à lancer sur chaque serveur. Il détecte les rôles installés, collecte tout ce qui
