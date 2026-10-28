@@ -1,0 +1,8 @@
+# Résultats d'audit : données sensibles, ne jamais committer
+AuditResults/
+Audit_*/
+Audit_*.zip
+Rapport_Consolide.html
+Constats_Consolides.csv
+# Outils tiers (à télécharger depuis Sysinternals)
+Coreinfo*.exe
