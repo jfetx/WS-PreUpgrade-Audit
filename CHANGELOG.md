@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.1 — 2026-10-28
+
+### Corrigé
+- **Coreinfo non exploité** : Coreinfo 4.x écrit en UTF-16 quand sa sortie est redirigée ; décodée en
+  OEM, elle contenait des caractères nuls et SSE4.2/POPCNT restaient « non confirmés » même sur un CPU
+  compatible. Les sorties UTF-16 des commandes externes sont désormais détectées et décodées.
+- **Événements clés** : un fournisseur d'événements absent de la machine (ex. KDC sur un serveur non DC)
+  faisait perdre toute la table ; chaque contrôle est maintenant isolé.
+- **Archive ZIP** : créée sans `Compress-Archive`, qui sous PowerShell 5.1 écrivait des « \ » dans les
+  chemins (avertissements / extraction incorrecte hors Windows).
+
+### CI
+- L'exécution réelle sur runner Windows échoue désormais si SSE4.2/POPCNT ne sont pas confirmés par
+  Coreinfo, si la section Événements a des erreurs de collecte ou si le ZIP contient des « \ ».
+
 ## 1.1.0 — 2026-10-28
 
 ### Ajouté

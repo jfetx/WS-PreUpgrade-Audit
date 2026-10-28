@@ -53,6 +53,16 @@ jobs:
           $errs = @($j.Sections | ForEach-Object { $s = $_; $_.Errors | ForEach-Object { "[$($s.Id)] $_" } })
           Write-Host "Erreurs de collecte : $($errs.Count)"; $errs | ForEach-Object { Write-Host "  $_" }
           Write-Host "Verdict : $($r.Verdict)"
+          # Contrôles de non-régression sur une vraie machine Windows
+          $bad = @()
+          $sse = @($j.Findings | Where-Object { $_.Title -like '*SSE4.2*' })
+          if ($sse) { $bad += "Coreinfo non exploité : $($sse[0].Title)" } else { Write-Host 'OK SSE4.2/POPCNT confirmés par Coreinfo' }
+          $bad += @($errs | Where-Object { $_ -like '`[Events`]*' })
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $za = [System.IO.Compression.ZipFile]::OpenRead($r.Zip)
+          $bs = @($za.Entries | Where-Object { $_.FullName -match '\\' }).Count; $za.Dispose()
+          if ($bs) { $bad += "ZIP : $bs entrée(s) avec « \ »" } else { Write-Host 'OK ZIP sans « \ »' }
+          if ($bad) { $bad | ForEach-Object { Write-Error $_ }; exit 1 }
       - name: Publier le rapport en artefact
         if: always()
         uses: actions/upload-artifact@v4

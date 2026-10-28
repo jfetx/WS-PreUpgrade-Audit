@@ -117,7 +117,7 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
 #region ===================== Initialisation =====================
-$Script:AuditVersion = '1.1.0'
+$Script:AuditVersion = '1.1.1'
 $Script:Start = Get-Date
 $Script:HostName = $env:COMPUTERNAME
 if (-not $Script:HostName) { $Script:HostName = [System.Net.Dns]::GetHostName() }
@@ -299,8 +299,17 @@ function Invoke-External {
         $lvl = if ($p.ExitCode -ne 0) { 'WARN' } else { 'DBG' }
         Write-Log ('      exec : {0} terminé en {1:N1} s (code {2})' -f (Split-Path $FilePath -Leaf), $sw.Elapsed.TotalSeconds, $p.ExitCode) $lvl
         $Script:ExternalLog.Add([pscustomobject]@{ Commande = "$FilePath $Arguments"; 'Durée (s)' = [math]::Round($sw.Elapsed.TotalSeconds, 1); Code = $p.ExitCode })
-        $txt = $o.Result
-        if ($e.Result) { $txt += "`r`n[stderr]`r`n" + $e.Result }
+        # Certains outils (Coreinfo 4.x...) écrivent en UTF-16 quand la sortie est redirigée :
+        # décodé en OEM, le texte contient alors des caractères nuls et les regex échouent.
+        $fix = {
+            param([string]$s)
+            if (-not $s -or $s.IndexOf([char]0) -lt 0) { return $s }
+            try { if (-not $enc) { throw 'pas d''encodage OEM' }; $s = [System.Text.Encoding]::Unicode.GetString($enc.GetBytes($s)) } catch { $s = $s -replace "`0", '' }
+            return $s.TrimStart([char]0xFEFF)
+        }
+        $txt = & $fix $o.Result
+        $err = & $fix $e.Result
+        if ($err) { $txt += "`r`n[stderr]`r`n" + $err }
         return $txt
     } catch {
         Write-Log ('      ! impossible d''exécuter {0} : {1}' -f $FilePath, $_.Exception.Message) 'WARN'
@@ -1145,7 +1154,8 @@ function Invoke-EventsCollector {
             $rows = foreach ($k in $keys) {
                 $fh = @{ LogName = $k.L; Id = $k.I; StartTime = $since }
                 if ($k.P) { $fh.ProviderName = $k.P }
-                $e = @(Get-WinEvent -FilterHashtable $fh -MaxEvents 500 -ErrorAction SilentlyContinue)
+                # Fournisseur absent de la machine (KDC hors DC...) : EventLogException non couverte par -ErrorAction
+                $e = @(); try { $e = @(Get-WinEvent -FilterHashtable $fh -MaxEvents 500 -ErrorAction SilentlyContinue) } catch { Write-Log "      $($k.T) : $($_.Exception.Message)" 'DBG' }
                 if ($k.I -contains 7 -and -not $k.P) { $e = @($e | Where-Object { $_.ProviderName -match 'disk|stor|iaStor|LSI|megasas|HpCISSs|SmartArray|stornvme|nvme|percsas|mpt|vhdmp' }) }
                 if ($e.Count) { Add-Finding $k.S 'Journaux' ("{0} : {1} occurrence(s) sur {2} j" -f $k.T, $e.Count, $EventDays) ("Dernière : {0}" -f ($e | Select-Object -First 1).TimeCreated) 'Analyser et corriger avant la migration (risque d''échec ou de rollback).' }
                 [pscustomobject]@{ 'Contrôle' = $k.T; 'Occurrences' = $e.Count; 'Dernière' = $(if ($e.Count) { ($e | Select-Object -First 1).TimeCreated }) }
@@ -2243,7 +2253,17 @@ $zip = $null
 if (-not $NoZip) {
     try {
         $zip = "$($Script:RunFolder).zip"
-        Compress-Archive -Path (Join-Path $Script:RunFolder '*') -DestinationPath $zip -Force -ErrorAction Stop
+        # Pas de Compress-Archive : sous PowerShell 5.1 il écrit des « \ » dans les chemins (archive mal lue hors Windows)
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem -ErrorAction Stop
+        if (Test-Path $zip) { Remove-Item $zip -Force -ErrorAction Stop }
+        $za = [System.IO.Compression.ZipFile]::Open($zip, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            $rootLen = (Resolve-Path -LiteralPath $Script:RunFolder).ProviderPath.TrimEnd('\', '/').Length + 1
+            foreach ($file in Get-ChildItem -LiteralPath $Script:RunFolder -Recurse -File -Force) {
+                $entry = $file.FullName.Substring($rootLen) -replace '\\', '/'
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($za, $file.FullName, $entry, [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+        } finally { $za.Dispose() }
     } catch { Write-Log "Archive ZIP : $($_.Exception.Message)" 'WARN'; $zip = $null }
 }
 Write-Log ("Verdict : {0}" -f $res.Verdict) $(if ($res.Verdict -like 'NON*') { 'ERR' } elseif ($res.Verdict -like '*CONDITIONS*') { 'WARN' } else { 'OK' })
