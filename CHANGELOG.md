@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2 — 2026-10-28
+
+### CI
+- Suppression du contrôle SSE4.2/POPCNT dans l'exécution réelle sur runner Windows : la CI ne dépend
+  plus du CPU du runner ni de l'accès à Sysinternals. Le script d'audit est inchangé (la vérification
+  SSE4.2/POPCNT par Coreinfo reste dans le rapport). Les contrôles Événements et ZIP sont conservés.
+
 ## 1.1.1 — 2026-10-28
 
 ### Corrigé

@@ -117,7 +117,7 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
 #region ===================== Initialisation =====================
-$Script:AuditVersion = '1.1.1'
+$Script:AuditVersion = '1.1.2'
 $Script:Start = Get-Date
 $Script:HostName = $env:COMPUTERNAME
 if (-not $Script:HostName) { $Script:HostName = [System.Net.Dns]::GetHostName() }
